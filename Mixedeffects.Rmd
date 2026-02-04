@@ -1,0 +1,160 @@
+---
+title: "Phase 3: Linear Mixed-Effects Models (Task 2)"
+output: html_document
+---
+Key Objectives of Task 2
+
+Justify the Model: Show that patients are different from each other (using ICC).
+
+Model the Trajectory: Determine if MMDs decrease over time (Slope).
+
+Identify Predictors: Find out which baseline factors (e.g., Age, Diagnosis, Drug type) make a patient respond better.
+```{r}
+install.packages(c("lme4", "lmerTest", "lattice", "car", "broom.mixed"))
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+library(lme4)       # Core package for Mixed Models (as per teacher's lesson)
+library(lmerTest)   # Adds p-values to the output
+library(dplyr)
+library(ggplot2)
+library(lattice)    # For visualizing random effects (teacher's preferred tool)
+```
+
+
+
+1. Data Preparation for Longitudinal Analysis
+The teacher's lesson emphasizes using a continuous time variable for slopes. Your data has CYCLE (1-3) and MONTH (1-12). We need to combine them into a single continuous timeline (Month 1 to Month 36).
+```{r}
+# CORRECTION: Re-create full_data using IMPUTED baseline
+# 1. Ensure you have the imputed baseline from Task 1 (MICE)
+# If you lost it, this line extracts it again from your mice object:
+baseline_imputed <- mice::complete(imputed_sets, 1)
+
+# 2. Re-merge Longitudinal data with the IMPUTED Baseline
+# We use 'inner_join' or ensure 'baseline_imputed' is the source
+full_data_clean <- left_join(longitudinal, baseline_imputed, by = "SUBJECT_ID")
+
+# 3. Re-create the LMM data object
+lmm_data <- full_data_clean %>%
+  mutate(
+    Time_Continuous = (as.numeric(CYCLE) - 1) * 12 + MONTH,
+    Baseline_Severity_Centered = scale(GGCEF_T0, center = TRUE, scale = FALSE)
+  )
+
+# 4. Filter for Complete Cases (Just to be safe)
+# This ensures that if there are any tiny remaining NAs in variables NOT imputed,
+# both models will use this exact same subset.
+lmm_data <- lmm_data %>% 
+  na.omit()
+```
+
+2. Model 1: The "Null" Model (Random Intercept Only)
+This model corresponds to the "Unconditional Means Model" in your teacher's notes. It answers: "How much of the variation in migraine days is due to differences between patients?"
+
+```{r}
+# Fixed Effect: None (just the intercept 1)
+# Random Effect: Intercept varies by SUBJECT_ID
+m0 <- lmer(MMDs ~ 1 + (1 | SUBJECT_ID), data = lmm_data, REML = FALSE)
+
+summary(m0)
+
+# Calculate Intraclass Correlation Coefficient (ICC)
+# Formula: Variance_Subject / (Variance_Subject + Variance_Residual)
+vars <- as.data.frame(VarCorr(m0))
+sigma2_subject <- vars[1, "vcov"]
+sigma2_residual <- vars[2, "vcov"]
+ICC <- sigma2_subject / (sigma2_subject + sigma2_residual)
+
+print(paste("ICC:", round(ICC, 3)))
+```
+
+Interpretation: If ICC > 0.1 (usually it is ~0.5-0.7 for migraines), it proves that Mixed Models are required because patients are highly distinct from one another.
+
+3. Model 2: The "Growth" Model (Random Slope)
+Now we add Time as a predictor. This answers: "Does the treatment work over time?" and "Do patients improve at different rates?"
+```{r}
+# Fixed Effect: Time_Continuous (The average slope of improvement)
+# Random Effect: (1 + Time_Continuous | SUBJECT_ID)
+# This allows every patient to have their own starting point AND their own rate of healing.
+m1 <- lmer(MMDs ~ Time_Continuous + (1 + Time_Continuous | SUBJECT_ID), 
+           data = lmm_data, REML = FALSE)
+
+summary(m1)
+
+# Compare with Model 0 (Is adding Time significant?)
+anova(m0, m1)
+```
+
+Check: Look at the Fixed effects: Time_Continuous estimate. If it is negative (e.g., -0.2), it means MMDs decrease by 0.2 days every month on average.
+
+4. Model 3: Predictors of Response (Task 2 Core)
+The schema asks: "Which baseline patient characteristics... predict treatment response?". To test this, we look for Interactions: Time * Predictor.
+
+If Time * BMI is significant, it means BMI changes the speed of recovery.
+```{r}
+# We test: Age, Sex, Antibody Type, and Baseline Severity
+m2 <- lmer(MMDs ~ Time_Continuous * ANTIBODY + 
+                  Time_Continuous * AGE + 
+                  Time_Continuous * DIAGNOSIS +
+                  Baseline_Severity_Centered +
+                  (1 + Time_Continuous | SUBJECT_ID), 
+           data = lmm_data, REML = FALSE)
+
+summary(m2)
+
+# Compare with the simpler model
+anova(m1, m2)
+```
+
+5. Visualizing Random Effects (Teacher's Method)
+Your teacher's document uses dotplot to show how different patients are. This satisfies the requirement to "estimate changes... using a hierarchical modeling framework".
+
+```{r}
+# Extract random effects (Intercepts and Slopes)
+ran_eff <- ranef(m1)
+
+# Plot the patient-specific slopes
+# Points to the left of 0 are "Super Responders" (steeper decrease)
+# Points to the right of 0 are "Non-Responders" (flat or increasing slope)
+dotplot(ran_eff, scales = list(relation = "free"))$SUBJECT_ID
+```
+
+```{r}
+# STEP 2: RUN LOGISTIC REGRESSION (Task 2)
+# -----------------------------------------------------------------------------
+
+# Fit the model
+# Note: Ensure 'Suspension' is a factor or 0/1 integer. 
+# If it is "Completed"/"Discontinued", glm() expects a factor.
+log_model <- glm(Suspension ~ AGE + SEX + DIAGNOSIS + BMI + ANTIBODY, 
+                 data = baseline_imputed, 
+                 family = binomial)
+
+summary(log_model)
+
+# Odds Ratios (easier to interpret for the report)
+exp(coef(log_model))
+```
+```{r}
+# ---------------------------------------------------------
+# NEW MODEL: Assessing Effect by CYCLE (Step-Change)
+# Requirement: "Fixed effects: time, cycle..." and "different temporal granularities"
+# ---------------------------------------------------------
+
+# Here we treat CYCLE as a Factor (Cycle 1 vs 2 vs 3) rather than a number
+m_cycle <- lmer(MMDs ~ CYCLE + Baseline_Severity_Centered + (1 | SUBJECT_ID), 
+                data = lmm_data, REML = FALSE)
+
+summary(m_cycle)
+# Interpretation: If Cycle 2 estimate is -2.5, it means Cycle 2 has 
+# 2.5 fewer migraine days on average than Cycle 1.
+```
+
+### **How to Interpret the Results for Your Report**
+1.  **ICC (Model 0):** Report this number. "An ICC of 0.65 indicated that 65% of the variance in MMDs was attributable to between-patient differences, justifying the use of LMM."
+2.  **Time Coefficient (Model 1):** "On average, patients experienced a reduction of $\beta$ MMDs per month ($p < 0.001$)."
+3.  **Predictors (Model 3):** Look at the **Interaction Terms** (e.g., `Time_Continuous:ANTIBODYGalcanezumab`).
+    * **If p < 0.05:** "Type of Antibody significantly modified the treatment trajectory."
+    * **If p > 0.05:** "No significant difference in response trajectory was found between antibody types or baseline diagnoses." (This is a valid and common result in real-world data [cite: 50]).
