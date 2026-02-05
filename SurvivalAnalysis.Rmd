@@ -1,0 +1,153 @@
+Phase 4: Survival Analysis.
+
+This phase answers Q4 from the Schema: "What is the time to achieving a ≥50% reduction in MMDs?" and "Which factors predict this response?"
+
+Key Concept: Time-to-Event Data
+
+Unlike the previous phases where we used every month of data, here we need to condense the data into one row per patient containing:
+
+Time: How long did it take to reach the goal (or drop out)?
+
+Status (Event): Did they reach the goal? (1= Yes, 0= Censored/No).
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+library(survival)   # Core survival package
+library(survminer)  # For beautiful Kaplan-Meier plots (Teacher's Lab preference)
+library(dplyr)
+library(mice)       # For pooling Cox models
+```
+
+1. Define the Event (Time-to-Response)
+We define the "Event" as the first month where a patient achieves ≥50% reduction in MMDs compared to their baseline (GGCEF_T0).
+
+```{r}
+# 1. Identify the first month of >= 50% reduction for each patient
+events <- full_data %>%
+  # Calculate % reduction for every month
+  mutate(Pct_Red = (GGCEF_T0 - MMDs) / GGCEF_T0) %>%
+  # Filter only the months where they "succeeded" (>= 50% reduction)
+  filter(Pct_Red >= 0.50) %>%
+  # Group by patient to find the EARLIEST success
+  group_by(SUBJECT_ID) %>%
+  summarise(
+    Event_Time = min(as.numeric(CYCLE)*12 - 12 + MONTH), # Convert Cycle/Month to 1-36 scale
+    Event_Status = 1 # Event occurred
+  )
+
+# 2. Handle "Censored" patients (Those who never reached 50%)
+# We take the Master List of patients and merge the event data
+survival_df <- baseline %>%
+  select(SUBJECT_ID, AGE, SEX, BMI, DIAGNOSIS, ANTIBODY, GGCEF_T0) %>%
+  left_join(events, by = "SUBJECT_ID") %>%
+  mutate(
+    # If Event_Time is NA, it means they never reached 50%.
+    # Their time is the last month they were observed (e.g., 36 months or dropout time)
+    Time = ifelse(is.na(Event_Time), 36, Event_Time),
+    
+    # If Event_Status is NA, they are "Censored" (0)
+    Status = ifelse(is.na(Event_Status), 0, 1)
+  )
+
+# Preview: Check the first few rows.
+# "Status = 1" means they responded. "Status = 0" means they finished the study (or dropped out) without responding.
+head(survival_df)
+```
+2. Kaplan-Meier Analysis (Descriptive)
+We visualize the probability of "Not Responding Yet" over time. Teacher's Note: The KM estimator is non-parametric (makes no assumptions about the distribution).
+
+```{r}
+# Fit the Kaplan-Meier Object
+km_fit <- survfit(Surv(Time, Status) ~ 1, data = survival_df)
+
+# Plot using survminer (Standard for publication)
+ggsurvplot(km_fit, 
+           data = survival_df,
+           risk.table = TRUE,     # Show number of patients at risk below plot
+           pval = TRUE,           # Show p-value (if comparing groups)
+           conf.int = TRUE,       # Show confidence intervals
+           xlab = "Time (Months)", 
+           ylab = "Probability of Non-Response",
+           title = "Time to First 50% Reduction in MMDs",
+           ggtheme = theme_minimal(),
+           palette = "Dark2")
+```
+2.1 Stratified KM Curve (by Phenotype)
+
+If you successfully ran (Phenotyping), we can see if the "Clusters" have different survival times. (If you haven't run Phase 3, you can skip this chunk or stratify by DIAGNOSIS instead).
+
+```{r}
+# Merge Cluster info if available (assuming 'pheno_features' exists from Phase 3)
+# If not, change 'Cluster' to 'ANTIBODY' to see drug differences.
+if(exists("pheno_features")) {
+  surv_cluster <- left_join(survival_df, pheno_features %>% select(SUBJECT_ID, Cluster), by = "SUBJECT_ID")
+  
+  km_fit_cluster <- survfit(Surv(Time, Status) ~ Cluster, data = surv_cluster)
+  
+  ggsurvplot(km_fit_cluster, 
+             data = surv_cluster,
+             pval = TRUE, # Log-Rank Test (compares the curves)
+             risk.table = TRUE,
+             title = "Time to Response by Phenotype",
+             xlab = "Months")
+}
+```
+3. Cox Proportional Hazards Model (Inferential)
+This answers: "Does Baseline BMI or Age predict how fast someone responds?"
+
+Rigor Alert: Since we imputed missing baseline data (BMI) using MICE in Phase 2, we must apply the Cox model to each imputed dataset and pool the results.
+
+```{r}
+# ------------------------------------------------------------------------------
+# 3. COX PROPORTIONAL HAZARDS MODEL (Pooled) - CORRECTED
+# ------------------------------------------------------------------------------
+
+# 1. Create a "Long" version of the imputed data
+# FIX: Set 'include = TRUE' so it keeps the original data (imp=0) for as.mids()
+imp_long <- complete(imputed_sets, action = "long", include = TRUE)
+
+# 2. Merge the Survival Outcome (Time/Status) into each imputed dataset
+# We join by ID so every imputed version gets the Time/Status columns
+imp_surv_long <- left_join(imp_long, 
+                           survival_df %>% select(SUBJECT_ID, Time, Status), 
+                           by = "SUBJECT_ID")
+
+# 3. Convert back to a 'mids' object for pooling
+# Now this works because it can find the original data (where .imp == 0)
+imp_surv_mids <- as.mids(imp_surv_long)
+
+# 4. Fit Cox Model on Imputed Data
+# We use 'with()' to run the model on all 5 datasets automatically
+fit_cox <- with(imp_surv_mids, coxph(Surv(Time, Status) ~ AGE + BMI + DIAGNOSIS + ANTIBODY))
+
+# 5. Pool the Results (Rubin's Rules)
+pooled_cox <- pool(fit_cox)
+
+# 6. Display Hazard Ratios (Exponentiated Coefficients)
+# HR > 1 means faster response, HR < 1 means slower response
+summary(pooled_cox, conf.int = TRUE, exponentiate = TRUE)
+```
+4. Checking Assumptions (Teacher's Requirement)
+The Cox model assumes "Proportional Hazards" (the risk ratio is constant over time). We test this using Schoenfeld Residuals.
+```{r}
+# We cannot run zph on a pooled object easily.
+# We run it on the first imputed dataset as a diagnostic proxy.
+fit_single <- coxph(Surv(Time, Status) ~ AGE + BMI + DIAGNOSIS + ANTIBODY, data = complete(imputed_sets, 1) %>% left_join(survival_df %>% select(SUBJECT_ID, Time, Status)))
+
+# Test Proportional Hazards
+test_ph <- cox.zph(fit_single)
+print(test_ph)
+
+# Plot residuals (If line is flat, assumption holds)
+ggcoxzph(test_ph)
+```
+
+
+### **How to Interpret for Your Report:**
+1.  **KM Plot:** Look for the **Median Survival Time** (where the probability hits 0.5). "The median time to achieve a 50% response was X months."
+2.  **Log-Rank Test (Stratified KM):** If $p < 0.05$, it means the phenotypes (or drugs) have significantly different speeds of response.
+3.  **Hazard Ratios (Cox Summary):**
+    * **HR = 1:** No effect.
+    * **HR > 1 (e.g., 1.5):** The factor *increases* the hazard (probability of response). In this context, **higher is better** (faster recovery). Example: "Patients with higher BMI had a 1.2x higher chance of responding at any given time."
+    * **HR < 1 (e.g., 0.8):** The factor *decreases* the hazard (slower recovery). "Older age was associated with a slower time to response."
+4.  **Assumptions:** If `cox.zph` gives $p < 0.05$ for any variable, the assumption is violated. You should report this honest limitation or consider stratifying the model.
