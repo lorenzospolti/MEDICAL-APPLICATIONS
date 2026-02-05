@@ -1,0 +1,121 @@
+---
+title: "Phase 3: Electronic Phenotyping & Trajectories (Task 3)"
+output: html_document
+---
+
+You are moving from "predicting the average" (Phase 3 LMM) to "grouping similar patients" (Phase 3 Phenotyping). The slides and schema specifically recommend using Temporal Abstraction (summarizing complex time-series into simple features like "Mean" or "Slope") and then applying Unsupervised Learning (Clustering).
+```{r}
+install.packages(c("factoextra", "cluster"))
+```
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(factoextra) # Essential for visualizing clusters (as per standard EP curriculum)
+library(cluster)
+```
+
+1. Feature Engineering (Temporal Abstraction)
+The Schema (Task 3) asks to "apply time-series binning" and compute statistics like "mean, trend slope, and volatility". We will convert the raw monthly data into these high-level features for each patient.
+
+```{r}
+# 1. Calculate Summary Stats per Patient (The "Abstraction" step)
+pheno_features <- full_data %>%
+  group_by(SUBJECT_ID) %>%
+  summarise(
+    # Feature A: "Level" (Average burden per Cycle)
+    Mean_C1 = mean(MMDs[CYCLE == 1], na.rm = TRUE),
+    Mean_C2 = mean(MMDs[CYCLE == 2], na.rm = TRUE),
+    Mean_C3 = mean(MMDs[CYCLE == 3], na.rm = TRUE),
+    
+    # Feature B: "Volatility" (How unstable is their migraine?)
+    Volatility = sd(MMDs, na.rm = TRUE),
+    
+    # Feature C: "Slope" (Rate of improvement)
+    # We fit a tiny linear model for each patient to get their personal slope
+    Slope = coef(lm(MMDs ~ as.numeric(MONTH) + as.numeric(CYCLE), na.action=na.exclude))[2]
+  ) %>%
+  drop_na() # K-Means cannot handle missing values
+
+# 2. Scale the data
+# Clustering is sensitive to units. We must normalize.
+pheno_scaled <- pheno_features %>%
+  select(-SUBJECT_ID) %>%
+  scale()
+
+# Add row names for tracking
+rownames(pheno_scaled) <- pheno_features$SUBJECT_ID
+
+head(pheno_scaled)
+```
+
+2. Determine Optimal Clusters (Elbow Method)
+Before clustering, we must decide how many phenotypes exist. We use the "Elbow Method" to look for the inflection point.
+```{r}
+fviz_nbclust(pheno_scaled, kmeans, method = "wss") +
+  labs(title = "Elbow Method for Optimal k",
+       subtitle = "Look for the 'bend' (likely k=3 or k=4)")
+```
+
+3. K-Means Clustering (Unsupervised Learning)
+We apply K-Means to identify the distinct groups requested in the schema (e.g., "Stable Responders" vs "Fluctuating Burden")
+```{r}
+set.seed(123) # Reproducibility
+k <- 3 # Adjust this based on the Elbow plot (usually 3 or 4 fits migraine data well)
+
+# Run K-Means
+km_res <- kmeans(pheno_scaled, centers = k, nstart = 25)
+
+# Visualize the clusters in 2D space (PCA reduction)
+fviz_cluster(km_res, data = pheno_scaled,
+             palette = "jco", 
+             ggtheme = theme_minimal(),
+             main = "Patient Phenotypes (Clustering Results)")
+```
+
+4. Characterizing the Phenotypes
+Now we interpret what these clusters actually mean. We merge the cluster labels back to the original trajectory data and plot them.
+```{r}
+# 1. Merge Cluster Labels back to Data
+pheno_features$Cluster <- as.factor(km_res$cluster)
+full_data_clustered <- left_join(full_data, 
+                                 pheno_features %>% select(SUBJECT_ID, Cluster), 
+                                 by = "SUBJECT_ID")
+
+# 2. Visualizing Trajectories by Phenotype
+# This answers: "Do distinct patient phenotypes emerge?" 
+traj_summary <- full_data_clustered %>%
+  group_by(Cluster, CYCLE, MONTH) %>%
+  summarise(Mean_MMD = mean(MMDs, na.rm = TRUE), .groups = "drop")
+
+ggplot(traj_summary, aes(x = MONTH, y = Mean_MMD, group = interaction(Cluster, CYCLE), color = Cluster)) +
+  geom_line(size = 1.2) +
+  facet_wrap(~CYCLE) +
+  labs(title = "Migraine Trajectories by Computational Phenotype",
+       subtitle = "Cluster 1 vs 2 vs 3 behavior over the 3 Cycles",
+       y = "Average MMDs", x = "Month") +
+  theme_minimal()
+```
+
+5. Clinical Interpretation (Validation)
+Do these clusters differ by baseline characteristics? This answers "Can these phenotypes stratify patients?".
+
+```{r}
+# Merge baseline info
+final_pheno <- left_join(pheno_features, baseline, by = "SUBJECT_ID")
+
+# Compare Age and Baseline Severity across Clusters
+boxplot(AGE ~ Cluster, data = final_pheno, main = "Age Distribution by Phenotype")
+boxplot(GGCEF_T0 ~ Cluster, data = final_pheno, main = "Baseline Severity by Phenotype")
+```
+
+### **How to Interpret the Results for Your Report**
+1.  **The Elbow Plot:** "Using the Elbow method on the abstracted temporal features (Mean, Slope, Volatility), we identified **k=3** optimal clusters."
+2.  **The Trajectory Plot (The "Spaghetti" Plot):** Look at the lines. You will likely see:
+    * **Cluster 1 (Super Responders):** Starts high, drops fast, stays low.
+    * **Cluster 2 (Partial/Late Responders):** Slow improvement.
+    * **Cluster 3 (Refractory/High Burden):** Starts high and stays high.
+3.  **Naming the Phenotypes:** The Schema explicitly asks you to label them (e.g., "Fluctuating Burden"). Use the trajectory plot to give each Cluster (1, 2, 3) a clinical name based on its shape.
